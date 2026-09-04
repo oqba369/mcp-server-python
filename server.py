@@ -57,7 +57,7 @@ YOUTUBE_COOKIE_SECRET_CANDIDATES = [
 ]
 
 
-SERVER_BUILD = '2026-09-04-visual-frames-v7'
+SERVER_BUILD = '2026-09-04-upload-from-media-v8'
 
 # Optional residential/ISP proxy for yt-dlp YouTube traffic.
 # Prefer the split variables so credentials are URL-encoded safely.
@@ -907,6 +907,52 @@ def youtube_upload_video_from_url(source_url: str, title: str, description: str 
         return {'uploaded': True, 'video': result, 'watch_url': f"https://www.youtube.com/watch?v={result['id']}" if result.get('id') else None}
     finally:
         path.unlink(missing_ok=True)
+
+@mcp.tool()
+def youtube_upload_video_from_media(
+    media_id: str,
+    title: str,
+    description: str = '',
+    privacy_status: str = 'private',
+    category_id: str = '22',
+    tags: list[str] | None = None,
+    made_for_kids: bool | None = None,
+) -> dict:
+    """Upload a video already stored in this MCP server's temporary media registry.
+
+    Use media_id values returned by tools such as video_download_my_video,
+    media_fetch_source_url, video_get_clip, or other media-producing tools.
+    The source file is not deleted after upload; it remains available until its
+    normal temporary-media expiry/cleanup.
+    """
+    if not title or not title.strip():
+        raise ValueError('title must not be empty.')
+
+    path = _resolve_media(media_id)
+
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise RuntimeError('The media_id does not point to a usable file.')
+
+    result = _upload_video_file(
+        path=path,
+        title=title.strip(),
+        description=description,
+        privacy_status=privacy_status,
+        category_id=category_id,
+        tags=tags,
+        made_for_kids=made_for_kids,
+    )
+
+    video_id = result.get('id')
+    return {
+        'uploaded': True,
+        'source_media_id': media_id,
+        'source_filename': path.name,
+        'source_size_bytes': path.stat().st_size,
+        'video': result,
+        'video_id': video_id,
+        'watch_url': f'https://www.youtube.com/watch?v={video_id}' if video_id else None,
+    }
 
 @mcp.tool()
 def youtube_set_thumbnail_from_url(video_id: str, image_url: str) -> dict:
