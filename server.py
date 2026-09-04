@@ -43,7 +43,13 @@ YOUTUBE_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
 YOUTUBE_REDIRECT_URI = os.environ.get('YOUTUBE_REDIRECT_URI')
 YOUTUBE_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
-SERVER_BUILD = '2026-09-04-proxy-debug-v4'
+# Full Netscape-format YouTube cookies content.
+# Primary variable requested by the user is lowercase: cookies
+# YOUTUBE_COOKIES is supported as a fallback alias.
+YOUTUBE_COOKIES = os.environ.get('cookies') or os.environ.get('YOUTUBE_COOKIES')
+
+
+SERVER_BUILD = '2026-09-04-proxy-cookie-debug-v5'
 
 # Optional residential/ISP proxy for yt-dlp YouTube traffic.
 # Prefer the split variables so credentials are URL-encoded safely.
@@ -333,7 +339,126 @@ def _youtube_ydl_options(outtmpl: str) -> dict[str, Any]:
         # yt-dlp supports HTTP/HTTPS/SOCKS proxy URLs through this option.
         options['proxy'] = proxy
 
+    cookie_file = _ensure_cookie_file()
+    if cookie_file:
+        options['cookiefile'] = str(cookie_file)
+
     return options
+
+
+
+def _normalized_cookie_text() -> str | None:
+    if not YOUTUBE_COOKIES:
+        return None
+
+    value = YOUTUBE_COOKIES.strip()
+
+    # Render normally preserves real newlines. This fallback also supports
+    # a value pasted with literal "\n" sequences instead of real line breaks.
+    if '\n' not in value and '\\n' in value:
+        value = value.replace('\\r\\n', '\n').replace('\\n', '\n')
+
+    return value.strip() + '\n'
+
+
+def _cookie_file_path() -> Path:
+    return MEDIA_DIR / 'youtube_cookies.txt'
+
+
+def _ensure_cookie_file() -> Path | None:
+    cookie_text = _normalized_cookie_text()
+    if not cookie_text:
+        return None
+
+    first_line = cookie_text.splitlines()[0].strip() if cookie_text.splitlines() else ''
+    if first_line not in {'# Netscape HTTP Cookie File', '# HTTP Cookie File'}:
+        raise RuntimeError(
+            'The cookies environment variable is configured, but it does not appear '
+            'to be a Netscape cookies.txt export. The first line must be '
+            '"# Netscape HTTP Cookie File" or "# HTTP Cookie File".'
+        )
+
+    path = _cookie_file_path()
+    current = None
+    try:
+        if path.exists():
+            current = path.read_text(encoding='utf-8')
+    except Exception:
+        current = None
+
+    if current != cookie_text:
+        path.write_text(cookie_text, encoding='utf-8')
+
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+    return path
+
+
+def _cookie_status_public() -> dict:
+    configured = bool(YOUTUBE_COOKIES)
+    if not configured:
+        return {
+            'configured': False,
+            'valid_netscape_header': False,
+            'file_ready': False,
+            'cookie_line_count': 0,
+            'youtube_domain_present': False,
+            'google_domain_present': False,
+        }
+
+    try:
+        cookie_text = _normalized_cookie_text() or ''
+        lines = [line for line in cookie_text.splitlines() if line.strip()]
+        first_line = lines[0].strip() if lines else ''
+        cookie_rows = [
+            line for line in lines
+            if not line.lstrip().startswith('#') and '\t' in line
+        ]
+
+        youtube_present = False
+        google_present = False
+        domains: set[str] = set()
+
+        for row in cookie_rows:
+            parts = row.split('\t')
+            if parts:
+                domain = parts[0].lstrip('.').lower()
+                domains.add(domain)
+                if domain == 'youtube.com' or domain.endswith('.youtube.com'):
+                    youtube_present = True
+                if domain == 'google.com' or domain.endswith('.google.com'):
+                    google_present = True
+
+        path = _ensure_cookie_file()
+
+        return {
+            'configured': True,
+            'valid_netscape_header': first_line in {
+                '# Netscape HTTP Cookie File',
+                '# HTTP Cookie File',
+            },
+            'file_ready': bool(path and path.exists()),
+            'cookie_line_count': len(cookie_rows),
+            'youtube_domain_present': youtube_present,
+            'google_domain_present': google_present,
+            'domain_count': len(domains),
+            'file_mode_octal': (
+                oct(path.stat().st_mode & 0o777)
+                if path and path.exists()
+                else None
+            ),
+        }
+    except Exception as exc:
+        return {
+            'configured': True,
+            'valid_netscape_header': False,
+            'file_ready': False,
+            'error_type': type(exc).__name__,
+            'error': _redact_proxy_secrets(str(exc)),
+        }
 
 
 def _proxy_public_config() -> dict:
@@ -509,6 +634,10 @@ def _yt_dlp_cli_diagnostic(video_id: str, use_proxy: bool = True, timeout_second
     proxy = _youtube_proxy_url() if use_proxy else None
     if proxy:
         command.extend(['--proxy', proxy])
+
+    cookie_file = _ensure_cookie_file()
+    if cookie_file:
+        command.extend(['--cookies', str(cookie_file)])
 
     command.append(url)
     started = time.perf_counter()
@@ -975,6 +1104,7 @@ def debug_config_status() -> dict:
         'youtube_client_secret_configured': bool(YOUTUBE_CLIENT_SECRET),
         'youtube_redirect_uri_configured': bool(YOUTUBE_REDIRECT_URI),
         'youtube_refresh_token_configured': bool(YOUTUBE_REFRESH_TOKEN),
+        'youtube_cookies': _cookie_status_public(),
         'youtube_proxy': _proxy_public_config(),
         'media_dir': str(MEDIA_DIR),
         'media_url_ttl_seconds': MEDIA_URL_TTL_SECONDS,
@@ -1013,6 +1143,7 @@ def debug_runtime_status(install_deno_if_missing: bool = True) -> dict:
         'curl_cffi_version': _package_version('curl-cffi'),
         'httpx_version': _package_version('httpx'),
         'certifi_version': _package_version('certifi'),
+        'youtube_cookies': _cookie_status_public(),
         'deno_path': deno_path,
         'deno_version': deno_version,
         'deno_error': deno_error,
@@ -1022,6 +1153,21 @@ def debug_runtime_status(install_deno_if_missing: bool = True) -> dict:
         'disk_total_bytes': disk.total,
         'disk_free_bytes': disk.free,
         'disk_used_bytes': disk.used,
+    }
+
+
+
+@mcp.tool()
+def debug_cookie_status() -> dict:
+    """Check whether YouTube cookies are configured and structurally usable without exposing values."""
+    return {
+        'server_build': SERVER_BUILD,
+        'cookies_environment_name': (
+            'cookies'
+            if os.environ.get('cookies')
+            else ('YOUTUBE_COOKIES' if os.environ.get('YOUTUBE_COOKIES') else None)
+        ),
+        'cookies': _cookie_status_public(),
     }
 
 
@@ -1153,6 +1299,7 @@ def debug_read_text_media(media_id: str, max_chars: int = 10000) -> dict:
 def debug_full_youtube_pipeline(video_id: str) -> dict:
     """Run a focused end-to-end diagnostic and identify the most likely failure layer."""
     config = _proxy_public_config()
+    cookie_status = _cookie_status_public()
     tcp = _debug_proxy_tcp_impl() if config.get('configured') else {'ok': False, 'error': 'proxy_not_configured'}
     exits = _debug_compare_exit_ips_impl() if config.get('configured') else {'proxy_verified': False}
     proxy_http = _debug_proxy_http_impl() if config.get('configured') else {'all_ok': False}
@@ -1174,9 +1321,22 @@ def debug_full_youtube_pipeline(video_id: str) -> dict:
     elif not proxy_http.get('tests', {}).get('youtube_generate_204', {}).get('ok'):
         likely_issue = 'proxy_cannot_reach_youtube'
         recommendations.append('The proxy works at TCP level but cannot successfully tunnel HTTPS traffic to YouTube.')
+    elif (
+        ('youtube_bot_challenge' in ytdlp.get('detected_issues', [])
+         or 'youtube_login_required' in ytdlp.get('detected_issues', []))
+        and not cookie_status.get('file_ready')
+    ):
+        likely_issue = 'youtube_cookies_missing_or_invalid'
+        recommendations.append(
+            'YouTube requires an authenticated session. Configure the lowercase Render environment variable '
+            '"cookies" with a valid Netscape cookies.txt export, then redeploy.'
+        )
     elif watch.get('contains_bot_challenge') or 'youtube_bot_challenge' in ytdlp.get('detected_issues', []):
-        likely_issue = 'youtube_bot_challenge'
-        recommendations.append('The residential IP is reaching YouTube but YouTube is challenging the session; cookies may be required.')
+        likely_issue = 'youtube_bot_challenge_even_with_cookies'
+        recommendations.append(
+            'The proxy works and cookies are present, but YouTube still challenges the session. '
+            'The exported cookies may be stale, incomplete, or tied to a different browser/IP session.'
+        )
     elif watch.get('contains_login_required') or 'youtube_login_required' in ytdlp.get('detected_issues', []):
         likely_issue = 'youtube_login_required'
         recommendations.append('YouTube is requiring an authenticated browser session for this request.')
@@ -1197,6 +1357,7 @@ def debug_full_youtube_pipeline(video_id: str) -> dict:
         'likely_issue': likely_issue,
         'recommendations': recommendations,
         'proxy_config': config,
+        'cookie_status': cookie_status,
         'proxy_tcp': tcp,
         'exit_ip_check': exits,
         'proxy_http': proxy_http,
@@ -1346,7 +1507,7 @@ def media_cleanup(confirm: bool = False) -> dict:
 
 @mcp.custom_route('/health', methods=['GET'])
 async def health(request: Request) -> Response:
-    return JSONResponse({'status': 'ok', 'service': 'youtube-mcp', 'server_build': SERVER_BUILD, 'server_sha256': _server_file_fingerprint().get('sha256'), 'youtube_client_configured': bool(YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REDIRECT_URI), 'youtube_authorized': bool(YOUTUBE_REFRESH_TOKEN), 'ffmpeg': FFMPEG_EXE, 'deno_on_path': shutil.which('deno'), 'deno_cached': str(DENO_EXE) if DENO_EXE.exists() else None, 'youtube_proxy_configured': bool(_youtube_proxy_url()), 'youtube_proxy_public': _proxy_public_config()})
+    return JSONResponse({'status': 'ok', 'service': 'youtube-mcp', 'server_build': SERVER_BUILD, 'server_sha256': _server_file_fingerprint().get('sha256'), 'youtube_client_configured': bool(YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REDIRECT_URI), 'youtube_authorized': bool(YOUTUBE_REFRESH_TOKEN), 'ffmpeg': FFMPEG_EXE, 'deno_on_path': shutil.which('deno'), 'deno_cached': str(DENO_EXE) if DENO_EXE.exists() else None, 'youtube_proxy_configured': bool(_youtube_proxy_url()), 'youtube_proxy_public': _proxy_public_config(), 'youtube_cookies': _cookie_status_public()})
 
 @mcp.custom_route('/oauth/start', methods=['GET'])
 async def oauth_start(request: Request) -> Response:
