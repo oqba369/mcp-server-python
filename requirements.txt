@@ -1,8 +1,12 @@
-mcp
-uvicorn[standard]
+mcp>=1.10,<2
+uvicorn
 starlette
 pytest
 anyio[trio]
 pytest-anyio
 httpx
 asgi-lifespan
+
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
