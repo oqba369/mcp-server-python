@@ -43,13 +43,21 @@ YOUTUBE_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
 YOUTUBE_REDIRECT_URI = os.environ.get('YOUTUBE_REDIRECT_URI')
 YOUTUBE_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
-# Full Netscape-format YouTube cookies content.
-# Primary variable requested by the user is lowercase: cookies
-# YOUTUBE_COOKIES is supported as a fallback alias.
+# YouTube cookies:
+# Preferred on Render: Secret File named "cookies", available at /etc/secrets/cookies.
+# Also supports /etc/secrets/youtube_cookies.txt and YOUTUBE_COOKIES_FILE.
+# Environment variables are retained only as a small/local fallback; do NOT put
+# a large cookies.txt export in a Render environment variable because Linux can
+# reject process startup with "argument list too long".
 YOUTUBE_COOKIES = os.environ.get('cookies') or os.environ.get('YOUTUBE_COOKIES')
+YOUTUBE_COOKIES_FILE = os.environ.get('YOUTUBE_COOKIES_FILE')
+YOUTUBE_COOKIE_SECRET_CANDIDATES = [
+    Path('/etc/secrets/cookies'),
+    Path('/etc/secrets/youtube_cookies.txt'),
+]
 
 
-SERVER_BUILD = '2026-09-04-proxy-cookie-debug-v5'
+SERVER_BUILD = '2026-09-04-secret-cookie-debug-v6'
 
 # Optional residential/ISP proxy for yt-dlp YouTube traffic.
 # Prefer the split variables so credentials are URL-encoded safely.
@@ -347,39 +355,96 @@ def _youtube_ydl_options(outtmpl: str) -> dict[str, Any]:
 
 
 
-def _normalized_cookie_text() -> str | None:
-    if not YOUTUBE_COOKIES:
-        return None
+def _cookie_secret_source() -> tuple[str | None, Path | None]:
+    """Locate a Render/local cookie secret file without exposing its contents."""
+    candidates: list[tuple[str, Path]] = []
 
-    value = YOUTUBE_COOKIES.strip()
+    if YOUTUBE_COOKIES_FILE:
+        candidates.append(('YOUTUBE_COOKIES_FILE', Path(YOUTUBE_COOKIES_FILE)))
 
-    # Render normally preserves real newlines. This fallback also supports
-    # a value pasted with literal "\n" sequences instead of real line breaks.
-    if '\n' not in value and '\\n' in value:
+    for candidate in YOUTUBE_COOKIE_SECRET_CANDIDATES:
+        candidates.append((f'secret_file:{candidate}', candidate))
+
+    for source_name, path in candidates:
+        try:
+            if path.exists() and path.is_file() and path.stat().st_size > 0:
+                return source_name, path
+        except OSError:
+            continue
+
+    return None, None
+
+
+def _normalized_cookie_text() -> tuple[str | None, str | None]:
+    """
+    Return (cookie_text, source_name).
+
+    Priority:
+      1. Explicit YOUTUBE_COOKIES_FILE
+      2. Render Secret File /etc/secrets/cookies
+      3. Render Secret File /etc/secrets/youtube_cookies.txt
+      4. Legacy cookies / YOUTUBE_COOKIES environment variable
+    """
+    source_name, source_path = _cookie_secret_source()
+
+    if source_path is not None:
+        try:
+            value = source_path.read_text(encoding='utf-8-sig')
+        except UnicodeDecodeError:
+            value = source_path.read_bytes().decode('utf-8', errors='replace')
+        except Exception as exc:
+            raise RuntimeError(
+                f'Cookie secret file exists but could not be read: {source_path}. '
+                f'Details: {exc}'
+            ) from exc
+    elif YOUTUBE_COOKIES:
+        source_name = (
+            'environment:cookies'
+            if os.environ.get('cookies')
+            else 'environment:YOUTUBE_COOKIES'
+        )
+        value = YOUTUBE_COOKIES
+    else:
+        return None, None
+
+    value = value.strip()
+
+    if source_path is None and '\n' not in value and '\\n' in value:
         value = value.replace('\\r\\n', '\n').replace('\\n', '\n')
 
-    return value.strip() + '\n'
+    value = value.replace('\r\n', '\n').replace('\r', '\n')
+
+    return value.strip() + '\n', source_name
 
 
 def _cookie_file_path() -> Path:
+    # yt-dlp receives a writable private copy, never the Render secret file itself.
     return MEDIA_DIR / 'youtube_cookies.txt'
 
 
+def _validate_cookie_text(cookie_text: str, source_name: str | None = None) -> None:
+    lines = cookie_text.splitlines()
+    first_line = lines[0].lstrip('\ufeff').strip() if lines else ''
+
+    if first_line not in {'# Netscape HTTP Cookie File', '# HTTP Cookie File'}:
+        source_label = source_name or 'configured cookie source'
+        raise RuntimeError(
+            f'{source_label} does not appear to be a Netscape cookies.txt export. '
+            'The first line must be "# Netscape HTTP Cookie File" or '
+            '"# HTTP Cookie File".'
+        )
+
+
 def _ensure_cookie_file() -> Path | None:
-    cookie_text = _normalized_cookie_text()
+    cookie_text, source_name = _normalized_cookie_text()
     if not cookie_text:
         return None
 
-    first_line = cookie_text.splitlines()[0].strip() if cookie_text.splitlines() else ''
-    if first_line not in {'# Netscape HTTP Cookie File', '# HTTP Cookie File'}:
-        raise RuntimeError(
-            'The cookies environment variable is configured, but it does not appear '
-            'to be a Netscape cookies.txt export. The first line must be '
-            '"# Netscape HTTP Cookie File" or "# HTTP Cookie File".'
-        )
+    _validate_cookie_text(cookie_text, source_name)
 
     path = _cookie_file_path()
     current = None
+
     try:
         if path.exists():
             current = path.read_text(encoding='utf-8')
@@ -398,10 +463,14 @@ def _ensure_cookie_file() -> Path | None:
 
 
 def _cookie_status_public() -> dict:
-    configured = bool(YOUTUBE_COOKIES)
-    if not configured:
+    source_name, source_path = _cookie_secret_source()
+    env_configured = bool(YOUTUBE_COOKIES)
+
+    if source_path is None and not env_configured:
         return {
             'configured': False,
+            'source': None,
+            'secret_file_found': False,
             'valid_netscape_header': False,
             'file_ready': False,
             'cookie_line_count': 0,
@@ -410,9 +479,11 @@ def _cookie_status_public() -> dict:
         }
 
     try:
-        cookie_text = _normalized_cookie_text() or ''
+        cookie_text, resolved_source = _normalized_cookie_text()
+        cookie_text = cookie_text or ''
         lines = [line for line in cookie_text.splitlines() if line.strip()]
-        first_line = lines[0].strip() if lines else ''
+        first_line = lines[0].lstrip('\ufeff').strip() if lines else ''
+
         cookie_rows = [
             line for line in lines
             if not line.lstrip().startswith('#') and '\t' in line
@@ -424,23 +495,39 @@ def _cookie_status_public() -> dict:
 
         for row in cookie_rows:
             parts = row.split('\t')
-            if parts:
-                domain = parts[0].lstrip('.').lower()
-                domains.add(domain)
-                if domain == 'youtube.com' or domain.endswith('.youtube.com'):
-                    youtube_present = True
-                if domain == 'google.com' or domain.endswith('.google.com'):
-                    google_present = True
+            if not parts:
+                continue
+
+            domain = parts[0].lstrip('.').lower()
+            if not domain:
+                continue
+
+            domains.add(domain)
+
+            if domain == 'youtube.com' or domain.endswith('.youtube.com'):
+                youtube_present = True
+
+            if domain == 'google.com' or domain.endswith('.google.com'):
+                google_present = True
 
         path = _ensure_cookie_file()
 
         return {
             'configured': True,
+            'source': resolved_source,
+            'secret_file_found': source_path is not None,
+            'secret_file_path': str(source_path) if source_path is not None else None,
+            'secret_file_size_bytes': (
+                source_path.stat().st_size
+                if source_path is not None and source_path.exists()
+                else None
+            ),
             'valid_netscape_header': first_line in {
                 '# Netscape HTTP Cookie File',
                 '# HTTP Cookie File',
             },
             'file_ready': bool(path and path.exists()),
+            'writable_copy_path': str(path) if path else None,
             'cookie_line_count': len(cookie_rows),
             'youtube_domain_present': youtube_present,
             'google_domain_present': google_present,
@@ -451,9 +538,21 @@ def _cookie_status_public() -> dict:
                 else None
             ),
         }
+
     except Exception as exc:
         return {
             'configured': True,
+            'source': source_name or (
+                'environment:cookies'
+                if os.environ.get('cookies')
+                else (
+                    'environment:YOUTUBE_COOKIES'
+                    if os.environ.get('YOUTUBE_COOKIES')
+                    else None
+                )
+            ),
+            'secret_file_found': source_path is not None,
+            'secret_file_path': str(source_path) if source_path is not None else None,
             'valid_netscape_header': False,
             'file_ready': False,
             'error_type': type(exc).__name__,
@@ -1162,10 +1261,10 @@ def debug_cookie_status() -> dict:
     """Check whether YouTube cookies are configured and structurally usable without exposing values."""
     return {
         'server_build': SERVER_BUILD,
-        'cookies_environment_name': (
-            'cookies'
-            if os.environ.get('cookies')
-            else ('YOUTUBE_COOKIES' if os.environ.get('YOUTUBE_COOKIES') else None)
+        'preferred_render_secret_file': '/etc/secrets/cookies',
+        'fallback_render_secret_file': '/etc/secrets/youtube_cookies.txt',
+        'environment_fallback_present': bool(
+            os.environ.get('cookies') or os.environ.get('YOUTUBE_COOKIES')
         ),
         'cookies': _cookie_status_public(),
     }
