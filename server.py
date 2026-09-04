@@ -15,9 +15,11 @@ import re
 import ipaddress
 import hashlib
 import importlib.metadata
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urljoin
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel
 
 import httpx
 import imageio_ffmpeg
@@ -35,6 +37,19 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+
+
+class ChatGPTFileRef(BaseModel):
+    """Temporary authorized file reference supplied by ChatGPT for openai/fileParams."""
+
+    download_url: str
+    file_id: str
+    mime_type: str | None = None
+    file_name: str | None = None
+    name: str | None = None
+    size: int | None = None
+    file_size_bytes: int | None = None
+
 
 MCP_API_TOKEN = os.environ.get('MCP_API_TOKEN')
 RENDER_EXTERNAL_HOSTNAME = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
@@ -57,7 +72,7 @@ YOUTUBE_COOKIE_SECRET_CANDIDATES = [
 ]
 
 
-SERVER_BUILD = '2026-09-04-upload-from-media-v8'
+SERVER_BUILD = '2026-09-04-chatgpt-file-upload-v9'
 
 # Optional residential/ISP proxy for yt-dlp YouTube traffic.
 # Prefer the split variables so credentials are URL-encoded safely.
@@ -194,6 +209,167 @@ def _resolve_media(media_id: str) -> Path:
     if not path.exists():
         raise RuntimeError('The temporary media file no longer exists.')
     return path
+
+
+def _assert_public_https_url(url: str) -> None:
+    """Reject non-HTTPS, credential-bearing, localhost, private, loopback and reserved destinations."""
+    parsed = urlsplit(url)
+
+    if parsed.scheme.lower() != 'https':
+        raise RuntimeError('ChatGPT attachment download URL must use HTTPS.')
+
+    if parsed.username or parsed.password:
+        raise RuntimeError('ChatGPT attachment download URL must not contain embedded credentials.')
+
+    host = parsed.hostname
+    if not host:
+        raise RuntimeError('ChatGPT attachment download URL has no hostname.')
+
+    lowered = host.rstrip('.').lower()
+    if lowered in {'localhost', 'localhost.localdomain'} or lowered.endswith('.localhost'):
+        raise RuntimeError('Localhost attachment download destinations are not allowed.')
+
+    def _check_ip(ip_text: str) -> None:
+        try:
+            ip = ipaddress.ip_address(ip_text)
+        except ValueError:
+            return
+
+        if not ip.is_global:
+            raise RuntimeError('Attachment download destination resolved to a non-public IP address.')
+
+    # Literal-IP hostname.
+    try:
+        literal_ip = ipaddress.ip_address(lowered)
+    except ValueError:
+        literal_ip = None
+
+    if literal_ip is not None:
+        _check_ip(lowered)
+        return
+
+    # DNS hostname. Reject if any returned address is non-public.
+    try:
+        results = socket.getaddrinfo(
+            lowered,
+            parsed.port or 443,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise RuntimeError('Could not resolve the ChatGPT attachment download host.') from exc
+
+    resolved = set()
+    for item in results:
+        sockaddr = item[4]
+        if not sockaddr:
+            continue
+        ip_text = sockaddr[0]
+        resolved.add(ip_text)
+        _check_ip(ip_text)
+
+    if not resolved:
+        raise RuntimeError('The ChatGPT attachment download host resolved to no usable addresses.')
+
+
+def _download_chatgpt_file_ref(
+    file_ref: ChatGPTFileRef,
+    destination: Path,
+    max_bytes: int = MAX_REMOTE_FILE_BYTES,
+    max_redirects: int = 5,
+) -> tuple[Path, str, int]:
+    """Stream a ChatGPT-authorized temporary download URL into local MCP media storage."""
+    declared_size = file_ref.file_size_bytes
+    if declared_size is None:
+        declared_size = file_ref.size
+
+    if declared_size is not None:
+        try:
+            declared_size = int(declared_size)
+        except (TypeError, ValueError):
+            declared_size = None
+
+    if declared_size is not None and declared_size > max_bytes:
+        raise RuntimeError(
+            f'Attached file is too large. Declared size is {declared_size} bytes; '
+            f'limit is {max_bytes} bytes.'
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.unlink(missing_ok=True)
+
+    current_url = file_ref.download_url
+    redirects = 0
+    total = 0
+    digest = hashlib.sha256()
+
+    timeout = httpx.Timeout(30.0, read=300.0, write=30.0, pool=30.0)
+    headers = {'User-Agent': 'YouTube-MCP/1.0 ChatGPT-File-Bridge'}
+
+    try:
+        with httpx.Client(
+            follow_redirects=False,
+            timeout=timeout,
+            headers=headers,
+        ) as client:
+            while True:
+                _assert_public_https_url(current_url)
+
+                with client.stream('GET', current_url) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get('location')
+                        if not location:
+                            raise RuntimeError('Attachment download redirect did not include a Location header.')
+
+                        redirects += 1
+                        if redirects > max_redirects:
+                            raise RuntimeError(
+                                f'Attachment download exceeded the redirect limit of {max_redirects}.'
+                            )
+
+                        current_url = urljoin(current_url, location)
+                        continue
+
+                    response.raise_for_status()
+
+                    content_length = response.headers.get('content-length')
+                    if content_length:
+                        try:
+                            remote_length = int(content_length)
+                        except ValueError:
+                            remote_length = None
+
+                        if remote_length is not None and remote_length > max_bytes:
+                            raise RuntimeError(
+                                f'Attached file is too large. Remote Content-Length is '
+                                f'{remote_length} bytes; limit is {max_bytes} bytes.'
+                            )
+
+                    with destination.open('wb') as handle:
+                        for chunk in response.iter_bytes(1024 * 1024):
+                            if not chunk:
+                                continue
+
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise RuntimeError(
+                                    f'Attached file exceeded the maximum allowed size of '
+                                    f'{max_bytes} bytes while downloading.'
+                                )
+
+                            digest.update(chunk)
+                            handle.write(chunk)
+
+                    break
+
+        if total <= 0 or not destination.exists() or destination.stat().st_size <= 0:
+            raise RuntimeError('ChatGPT attachment download produced an empty file.')
+
+        return destination, digest.hexdigest(), total
+
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
 
 def _download_url(url: str, destination: Path, max_bytes: int = MAX_REMOTE_FILE_BYTES) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1580,6 +1756,60 @@ def video_download_my_video(video_id: str) -> dict:
             'Private or otherwise restricted videos may still require the original source file from Drive/object storage. '
             'Details: ' + details
         ) from exc
+
+
+@mcp.tool(meta={'openai/fileParams': ['file']})
+def media_upload_file(file: ChatGPTFileRef) -> dict:
+    """Import a file attached directly in ChatGPT and return an MCP media_id.
+
+    ChatGPT replaces this top-level file argument with a temporary authorized
+    object containing download_url/file_id and optional filename/MIME/size
+    metadata. The binary file is streamed directly from that temporary URL
+    into this server; it is never base64-encoded into the model context.
+    """
+    supplied_name = file.file_name or file.name
+
+    if supplied_name:
+        safe_name = _safe_filename(Path(supplied_name).name)
+    else:
+        safe_id = _safe_filename(file.file_id or uuid.uuid4().hex)
+        safe_name = f'chatgpt_{safe_id}.bin'
+
+    destination = MEDIA_DIR / f'chatgpt_{uuid.uuid4().hex}_{safe_name}'
+
+    downloaded_path, sha256_hex, actual_size = _download_chatgpt_file_ref(
+        file_ref=file,
+        destination=destination,
+        max_bytes=MAX_REMOTE_FILE_BYTES,
+    )
+
+    published = _publish_media(downloaded_path)
+
+    declared_size = file.file_size_bytes
+    if declared_size is None:
+        declared_size = file.size
+
+    try:
+        declared_size_int = int(declared_size) if declared_size is not None else None
+    except (TypeError, ValueError):
+        declared_size_int = None
+
+    published.update({
+        'source': 'chatgpt_attachment',
+        'source_file_id': file.file_id,
+        'mime_type': file.mime_type,
+        'sha256': sha256_hex,
+        'actual_size_bytes': actual_size,
+        'declared_size_bytes': declared_size_int,
+        'size_matches_declared': (
+            actual_size == declared_size_int
+            if declared_size_int is not None
+            else None
+        ),
+    })
+
+    return published
+
 
 @mcp.tool()
 def media_fetch_source_url(source_url: str, filename: str = 'source.bin') -> dict:
