@@ -23,7 +23,7 @@ import httpx
 import imageio_ffmpeg
 import yt_dlp
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
 
 from starlette.requests import Request
@@ -57,7 +57,7 @@ YOUTUBE_COOKIE_SECRET_CANDIDATES = [
 ]
 
 
-SERVER_BUILD = '2026-09-04-secret-cookie-debug-v6'
+SERVER_BUILD = '2026-09-04-visual-frames-v7'
 
 # Optional residential/ISP proxy for yt-dlp YouTube traffic.
 # Prefer the split variables so credentials are URL-encoded safely.
@@ -1549,17 +1549,65 @@ def video_probe(media_id: str) -> dict:
     return {'media_id': media_id, 'filename': path.name, 'size_bytes': path.stat().st_size, 'ffmpeg_info': (result.stderr or '')[-12000:]}
 
 @mcp.tool()
-def video_extract_frames(media_id: str, interval_seconds: float = 5.0, max_frames: int = 12) -> dict:
+def video_extract_frames(media_id: str, interval_seconds: float = 5.0, max_frames: int = 12) -> Image:
+    """Extract representative video frames and return a visual contact sheet for model inspection."""
     if interval_seconds <= 0:
         raise ValueError('interval_seconds must be > 0.')
+
     max_frames = max(1, min(int(max_frames), 50))
     source = _resolve_media(media_id)
+
     job_dir = MEDIA_DIR / f'frames_{uuid.uuid4().hex}'
     job_dir.mkdir(parents=True, exist_ok=True)
+
     output_pattern = job_dir / 'frame_%03d.jpg'
-    _run_ffmpeg(['-y', '-i', str(source), '-vf', f'fps=1/{float(interval_seconds)}', '-frames:v', str(max_frames), '-q:v', '2', str(output_pattern)], timeout=600)
-    frames = [_publish_media(path) for path in sorted(job_dir.glob('frame_*.jpg'))]
-    return {'source_media_id': media_id, 'interval_seconds': interval_seconds, 'count': len(frames), 'frames': frames}
+
+    # First extract actual frames at the requested interval.
+    _run_ffmpeg(
+        [
+            '-y',
+            '-i', str(source),
+            '-vf', f'fps=1/{float(interval_seconds)}',
+            '-frames:v', str(max_frames),
+            '-q:v', '2',
+            str(output_pattern),
+        ],
+        timeout=600,
+    )
+
+    frame_paths = sorted(job_dir.glob('frame_*.jpg'))
+    if not frame_paths:
+        raise RuntimeError('FFmpeg completed but no frames were extracted.')
+
+    # Build one compact contact sheet. Returning one MCP ImageContent block lets
+    # ChatGPT actually inspect the pixels instead of only receiving temporary URLs.
+    count = len(frame_paths)
+    cols = min(5, max(1, count))
+    rows = (count + cols - 1) // cols
+
+    sheet_path = job_dir / 'contact_sheet.jpg'
+    tile_filter = (
+        f'scale=220:-1,'
+        f'tile={cols}x{rows}:padding=4:margin=4:color=black'
+    )
+
+    _run_ffmpeg(
+        [
+            '-y',
+            '-framerate', '1',
+            '-i', str(job_dir / 'frame_%03d.jpg'),
+            '-vf', tile_filter,
+            '-frames:v', '1',
+            '-q:v', '2',
+            str(sheet_path),
+        ],
+        timeout=600,
+    )
+
+    if not sheet_path.exists() or sheet_path.stat().st_size == 0:
+        raise RuntimeError('Contact sheet creation failed.')
+
+    return Image(path=str(sheet_path))
 
 @mcp.tool()
 def video_extract_audio(media_id: str, audio_format: str = 'mp3') -> dict:
