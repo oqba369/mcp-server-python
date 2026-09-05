@@ -28,11 +28,38 @@ INIT_BODY = {
 
 
 def parse_sse_data(text: str) -> dict:
-    """Extract the JSON payload from an SSE response."""
+    """Extract the JSON payload from either SSE or JSON MCP responses."""
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        return json.loads(stripped)
     for line in text.strip().splitlines():
         if line.startswith("data: "):
             return json.loads(line[len("data: "):])
     raise ValueError(f"No data line in SSE response: {text}")
+
+
+def test_extract_youtube_video_id():
+    assert server_module._extract_youtube_video_id("dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert server_module._extract_youtube_video_id(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=5"
+    ) == "dQw4w9WgXcQ"
+    assert server_module._extract_youtube_video_id(
+        "https://youtu.be/dQw4w9WgXcQ"
+    ) == "dQw4w9WgXcQ"
+    assert server_module._extract_youtube_video_id(
+        "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+    ) == "dQw4w9WgXcQ"
+
+    with pytest.raises(ValueError):
+        server_module._extract_youtube_video_id("https://example.com/dQw4w9WgXcQ")
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds"),
+    [("PT45S", 45), ("PT1M30S", 90), ("PT2H3M4S", 7384), ("P1DT2S", 86402)],
+)
+def test_iso8601_duration_seconds(value, seconds):
+    assert server_module._iso8601_duration_seconds(value) == seconds
 
 
 @pytest.fixture(scope="module")
@@ -55,7 +82,9 @@ async def test_health(managed_app):
     ) as client:
         resp = await client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["service"] == "youtube-mcp"
 
 
 @pytest.mark.anyio
@@ -86,7 +115,7 @@ async def test_mcp_correct_token(managed_app, authed_headers):
         resp = await client.post("/mcp", headers=authed_headers, json=INIT_BODY)
     assert resp.status_code == 200
     data = parse_sse_data(resp.text)
-    assert data["result"]["serverInfo"]["name"] == "my-mcp-server"
+    assert data["result"]["serverInfo"]["name"] == "youtube-mcp"
 
 
 @pytest.mark.anyio
@@ -139,3 +168,44 @@ async def test_tool_call(managed_app, authed_headers):
         assert resp.status_code == 200
         data = parse_sse_data(resp.text)
         assert data["result"]["content"][0]["text"] == "Hello, World!"
+
+
+@pytest.mark.anyio
+async def test_public_video_analysis_tools_are_registered(managed_app, authed_headers):
+    async with AsyncClient(
+        transport=ASGITransport(app=managed_app), base_url=BASE_URL
+    ) as client:
+        resp = await client.post(
+            "/mcp",
+            headers=authed_headers,
+            json={"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        )
+    assert resp.status_code == 200
+    data = parse_sse_data(resp.text)
+    names = {tool["name"] for tool in data["result"]["tools"]}
+    assert "youtube_search_analysis_videos" in names
+    assert "video_download_public_video" in names
+
+
+@pytest.mark.anyio
+async def test_public_download_rejects_invalid_video_id(managed_app, authed_headers):
+    async with AsyncClient(
+        transport=ASGITransport(app=managed_app), base_url=BASE_URL
+    ) as client:
+        resp = await client.post(
+            "/mcp",
+            headers=authed_headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "video_download_public_video",
+                    "arguments": {"video_id_or_url": "not-a-youtube-video"},
+                },
+            },
+        )
+    assert resp.status_code == 200
+    data = parse_sse_data(resp.text)
+    assert data["result"]["isError"] is True
+    assert "valid 11-character YouTube video ID" in data["result"]["content"][0]["text"]
