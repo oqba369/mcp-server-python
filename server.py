@@ -15,7 +15,7 @@ import re
 import ipaddress
 import hashlib
 import importlib.metadata
-from urllib.parse import quote, urlsplit, urljoin
+from urllib.parse import parse_qs, quote, urlsplit, urljoin
 from pathlib import Path
 from typing import Any
 
@@ -72,7 +72,7 @@ YOUTUBE_COOKIE_SECRET_CANDIDATES = [
 ]
 
 
-SERVER_BUILD = '2026-09-04-chatgpt-file-upload-v9'
+SERVER_BUILD = '2026-09-05-public-video-analysis-v10'
 
 # Optional residential/ISP proxy for yt-dlp YouTube traffic.
 # Prefer the split variables so credentials are URL-encoded safely.
@@ -172,6 +172,48 @@ def _safe_filename(name: str) -> str:
             keep.append('_')
     result = ''.join(keep).strip('._')
     return result[:180] or f'file_{uuid.uuid4().hex[:8]}'
+
+
+def _extract_youtube_video_id(video_id_or_url: str) -> str:
+    """Return a validated YouTube video ID from an ID or standard watch URL."""
+    value = (video_id_or_url or '').strip()
+    if re.fullmatch(r'[A-Za-z0-9_-]{11}', value):
+        return value
+
+    parsed = urlsplit(value)
+    host = (parsed.hostname or '').lower().rstrip('.')
+    if host.startswith('www.'):
+        host = host[4:]
+    if host.startswith('m.'):
+        host = host[2:]
+
+    candidate = ''
+    if host == 'youtu.be':
+        candidate = parsed.path.strip('/').split('/')[0]
+    elif host in {'youtube.com', 'youtube-nocookie.com'}:
+        parts = [part for part in parsed.path.split('/') if part]
+        if parsed.path.rstrip('/') == '/watch':
+            candidate = (parse_qs(parsed.query).get('v') or [''])[0]
+        elif len(parts) >= 2 and parts[0] in {'shorts', 'embed', 'live'}:
+            candidate = parts[1]
+
+    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', candidate):
+        raise ValueError('Provide a valid 11-character YouTube video ID or standard YouTube video URL.')
+    return candidate
+
+
+def _iso8601_duration_seconds(value: str | None) -> int | None:
+    """Parse the day/hour/minute/second subset used by YouTube contentDetails.duration."""
+    if not value:
+        return None
+    match = re.fullmatch(
+        r'P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?',
+        value,
+    )
+    if not match:
+        return None
+    parts = {name: int(number or 0) for name, number in match.groupdict().items()}
+    return parts['days'] * 86400 + parts['hours'] * 3600 + parts['minutes'] * 60 + parts['seconds']
 
 def _cleanup_expired_media() -> None:
     now = time.time()
@@ -1241,6 +1283,85 @@ def youtube_search(query: str, resource_type: str = 'video', max_results: int = 
         raise ValueError('resource_type must be video, channel, or playlist.')
     return _youtube().search().list(part='snippet', q=query, type=resource_type, maxResults=max(1, min(int(max_results), 50))).execute()
 
+
+@mcp.tool()
+def youtube_search_analysis_videos(
+    query: str,
+    max_results: int = 20,
+    order: str = 'viewCount',
+    video_duration: str = 'short',
+    region_code: str = 'US',
+    relevance_language: str = 'en',
+    published_after: str | None = None,
+) -> dict:
+    """Find public YouTube videos for comparative editing analysis and include performance metadata."""
+    if not query or not query.strip():
+        raise ValueError('query must not be empty.')
+
+    allowed_orders = {'date', 'rating', 'relevance', 'title', 'videoCount', 'viewCount'}
+    if order not in allowed_orders:
+        raise ValueError(f'order must be one of {sorted(allowed_orders)}')
+    if video_duration not in {'any', 'short', 'medium', 'long'}:
+        raise ValueError('video_duration must be any, short, medium, or long.')
+    if not re.fullmatch(r'[A-Za-z]{2}', region_code or ''):
+        raise ValueError('region_code must be a two-letter country code such as US.')
+
+    limit = max(1, min(int(max_results), 50))
+    search_params: dict[str, Any] = {
+        'part': 'snippet',
+        'q': query.strip(),
+        'type': 'video',
+        'maxResults': limit,
+        'order': order,
+        'videoDuration': video_duration,
+        'regionCode': region_code.upper(),
+        'relevanceLanguage': relevance_language,
+        'safeSearch': 'moderate',
+    }
+    if published_after:
+        search_params['publishedAfter'] = published_after
+
+    search_result = _youtube().search().list(**search_params).execute()
+    search_items = search_result.get('items', [])
+    video_ids = [item.get('id', {}).get('videoId') for item in search_items]
+    video_ids = [video_id for video_id in video_ids if video_id]
+    if not video_ids:
+        return {
+            'query': query.strip(),
+            'count': 0,
+            'order': order,
+            'video_duration': video_duration,
+            'videos': [],
+        }
+
+    details_result = _youtube().videos().list(
+        part='snippet,contentDetails,status,statistics,liveStreamingDetails',
+        id=','.join(video_ids),
+    ).execute()
+    details_by_id = {item['id']: item for item in details_result.get('items', [])}
+
+    videos = []
+    for rank, video_id in enumerate(video_ids, start=1):
+        video = details_by_id.get(video_id)
+        if not video:
+            continue
+        duration_iso = video.get('contentDetails', {}).get('duration')
+        video['searchRank'] = rank
+        video['durationSeconds'] = _iso8601_duration_seconds(duration_iso)
+        video['watchUrl'] = f'https://www.youtube.com/watch?v={video_id}'
+        videos.append(video)
+
+    return {
+        'query': query.strip(),
+        'count': len(videos),
+        'order': order,
+        'video_duration': video_duration,
+        'region_code': region_code.upper(),
+        'relevance_language': relevance_language,
+        'published_after': published_after,
+        'videos': videos,
+    }
+
 @mcp.tool()
 def youtube_analytics_report(start_date: str, end_date: str, metrics: str = 'views,estimatedMinutesWatched,averageViewDuration', dimensions: str | None = None, filters: str | None = None, sort: str | None = None, max_results: int = 200) -> dict:
     kwargs: dict[str, Any] = {'ids': 'channel==MINE', 'startDate': start_date, 'endDate': end_date, 'metrics': metrics, 'maxResults': max(1, min(int(max_results), 200))}
@@ -1756,6 +1877,107 @@ def video_download_my_video(video_id: str) -> dict:
             'Private or otherwise restricted videos may still require the original source file from Drive/object storage. '
             'Details: ' + details
         ) from exc
+
+
+@mcp.tool()
+def video_download_public_video(
+    video_id_or_url: str,
+    max_height: int = 720,
+    max_duration_seconds: int = 1800,
+) -> dict:
+    """Download an unrestricted public YouTube video for analysis and return a temporary media_id.
+
+    Use only for videos the user owns or is permitted to analyze. The tool does
+    not bypass private, members-only, paid, DRM-protected, age-restricted, or
+    live content. Pass the returned media_id to video_probe,
+    video_extract_frames, video_extract_audio, or video_get_clip.
+    """
+    video_id = _extract_youtube_video_id(video_id_or_url)
+    max_height = max(240, min(int(max_height), 1080))
+    max_duration_seconds = max(1, min(int(max_duration_seconds), 4 * 3600))
+
+    result = _youtube().videos().list(
+        part='snippet,contentDetails,status,statistics,liveStreamingDetails',
+        id=video_id,
+    ).execute()
+    items = result.get('items', [])
+    if not items:
+        raise RuntimeError('The video was not found or is not accessible to this YouTube account.')
+
+    video = items[0]
+    privacy_status = video.get('status', {}).get('privacyStatus')
+    if privacy_status != 'public':
+        raise PermissionError('Only public videos can be downloaded with this analysis tool.')
+    if video.get('snippet', {}).get('liveBroadcastContent') != 'none' or video.get('liveStreamingDetails'):
+        raise RuntimeError('Live streams and premieres are not supported by this analysis tool.')
+
+    duration_iso = video.get('contentDetails', {}).get('duration')
+    duration_seconds = _iso8601_duration_seconds(duration_iso)
+    if duration_seconds is not None and duration_seconds > max_duration_seconds:
+        raise RuntimeError(
+            f'Video duration is {duration_seconds} seconds; the requested limit is '
+            f'{max_duration_seconds} seconds.'
+        )
+
+    title = video.get('snippet', {}).get('title') or video_id
+    base = MEDIA_DIR / f'yt_public_{video_id}_{uuid.uuid4().hex}'
+    outtmpl = str(base) + '.%(ext)s'
+    url = f'https://www.youtube.com/watch?v={video_id}'
+
+    try:
+        ydl_opts = _youtube_ydl_options(outtmpl)
+        ydl_opts.update({
+            'format': (
+                f'bv*[height<={max_height}]+ba/b[height<={max_height}]'
+                f'/best[height<={max_height}]'
+            ),
+            'max_filesize': MAX_REMOTE_FILE_BYTES,
+        })
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        candidates = [
+            path for path in MEDIA_DIR.glob(base.name + '.*')
+            if path.is_file() and not path.name.endswith(('.part', '.ytdl', '.temp'))
+        ]
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise RuntimeError('yt-dlp finished but no final output file was found.')
+
+        path = candidates[0]
+        if path.stat().st_size > MAX_REMOTE_FILE_BYTES:
+            path.unlink(missing_ok=True)
+            raise RuntimeError(f'Downloaded video exceeds the {MAX_REMOTE_FILE_BYTES}-byte media limit.')
+
+        published = _publish_media(path)
+        published.update({
+            'source': 'youtube_public_video',
+            'video_id': video_id,
+            'title': title,
+            'channel_id': video.get('snippet', {}).get('channelId'),
+            'channel_title': video.get('snippet', {}).get('channelTitle'),
+            'published_at': video.get('snippet', {}).get('publishedAt'),
+            'statistics': video.get('statistics', {}),
+            'source_watch_url': url,
+            'duration_seconds': info.get('duration') or duration_seconds,
+            'max_height': max_height,
+            'extractor': info.get('extractor_key') or info.get('extractor'),
+            'analysis_tools': [
+                'video_probe',
+                'video_extract_frames',
+                'video_extract_audio',
+                'video_get_clip',
+            ],
+        })
+        return published
+    except Exception as exc:
+        for partial in MEDIA_DIR.glob(base.name + '.*'):
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass
+        details = _redact_proxy_secrets(str(exc))
+        raise RuntimeError('Could not download this public YouTube video for analysis. Details: ' + details) from exc
 
 
 @mcp.tool(meta={'openai/fileParams': ['file']})
