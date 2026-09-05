@@ -3,8 +3,8 @@ Thin MCP8 entrypoint.
 
 The stable YouTube/media implementation lives in server_base.py.
 This module extends it with research-oriented tools for building
-viral-vs-control datasets, editing metrics, and an authorization-aware
-YouTube import tool intended specifically for temporary AI video analysis.
+viral-vs-control datasets, editing metrics, and a public-video downloader
+that does not reuse authenticated YouTube cookies.
 """
 
 import json
@@ -15,12 +15,12 @@ import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import server_base as _base
 from server_base import *  # re-export the existing MCP app/tools for Render
 
-SERVER_BUILD = "2026-09-05-research-dataset-v13-analysis-import"
+SERVER_BUILD = "2026-09-05-research-dataset-v12-public-download"
 _base.SERVER_BUILD = SERVER_BUILD
 
 
@@ -273,7 +273,7 @@ def youtube_build_research_set(
             "views/day, engagement, and views/subscriber when public. "
             "It is a research heuristic, not an absolute YouTube virality claim."
         ),
-        "analysis_import_tool": "youtube_import_video_for_analysis",
+        "download_tool": "video_download_public_video",
         "analysis_tools": [
             "video_extract_frames",
             "video_extract_audio",
@@ -427,63 +427,46 @@ def dataset_export_jsonl(
     return published
 
 
-# MCP8_ANALYSIS_IMPORT_V13
-# This tool is intentionally framed and implemented as an authorization-aware,
-# temporary media-import path for AI research. It is not a redistribution tool.
-
-AnalysisRightsBasis = Literal[
-    "owned",
-    "creative_commons",
-    "explicit_permission",
-]
-
-
-def _analysis_youtube_ydl_options(
+# MCP8_PUBLIC_DOWNLOADER_V12
+# Public-video analysis deliberately does not reuse the authenticated cookie jar.
+# Cookies remain available to server_base.video_download_my_video and other owned-video flows.
+def _public_youtube_ydl_options(
     outtmpl: str,
     max_height: int,
+    player_client: str,
     *,
-    use_cookies: bool,
-    player_client: str | None = None,
     skip_webpage: bool = False,
     impersonate: bool = False,
 ) -> dict[str, Any]:
-    """Build yt-dlp options for authorized temporary analysis imports."""
-    if use_cookies:
-        options = dict(_base._youtube_ydl_options(outtmpl))
-        options["format"] = (
-            f"bv*[height<={max_height}]+ba/"
-            f"b[height<={max_height}]/b"
-        )
-    else:
-        deno = _base._ensure_deno()
-        options = {
-            "outtmpl": outtmpl,
-            "format": (
-                f"bv*[height<={max_height}]+ba/"
-                f"b[height<={max_height}]/b"
-            ),
-            "merge_output_format": "mp4",
-            "ffmpeg_location": _base.FFMPEG_EXE,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "js_runtimes": {"deno": {"path": str(deno)}},
-            "remote_components": {"ejs:npm"},
-            "socket_timeout": 30,
-            "retries": 3,
-            "fragment_retries": 3,
-        }
-        proxy = _base._youtube_proxy_url()
-        if proxy:
-            options["proxy"] = proxy
-
-    youtube_args: dict[str, list[str]] = {}
-    if player_client:
-        youtube_args["player_client"] = [player_client]
+    deno = _base._ensure_deno()
+    youtube_args: dict[str, list[str]] = {
+        "player_client": [player_client],
+    }
     if skip_webpage:
         youtube_args["player_skip"] = ["webpage", "configs"]
-    if youtube_args:
-        options["extractor_args"] = {"youtube": youtube_args}
+
+    options: dict[str, Any] = {
+        "outtmpl": outtmpl,
+        "format": (
+            f"bv*[height<={max_height}]+ba/"
+            f"b[height<={max_height}]/b"
+        ),
+        "merge_output_format": "mp4",
+        "ffmpeg_location": _base.FFMPEG_EXE,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "js_runtimes": {"deno": {"path": str(deno)}},
+        "remote_components": {"ejs:npm"},
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_args": {"youtube": youtube_args},
+    }
+
+    proxy = _base._youtube_proxy_url()
+    if proxy:
+        options["proxy"] = proxy
 
     if impersonate:
         options["impersonate"] = "chrome"
@@ -491,7 +474,7 @@ def _analysis_youtube_ydl_options(
     return options
 
 
-def _clean_analysis_attempt_files(base: Path) -> None:
+def _clean_public_attempt_files(base: Path) -> None:
     for candidate in _base.MEDIA_DIR.glob(base.name + ".*"):
         try:
             if candidate.is_file():
@@ -500,67 +483,10 @@ def _clean_analysis_attempt_files(base: Path) -> None:
             pass
 
 
-def _verify_analysis_rights(
-    video: dict,
-    rights_basis: AnalysisRightsBasis,
-    permission_note: str | None,
-) -> dict:
-    """Validate the declared authorization basis before importing media."""
-    snippet = video.get("snippet", {})
-    status = video.get("status", {})
-
-    if rights_basis == "owned":
-        owner_channel_id = snippet.get("channelId")
-        authenticated_channel_id = _base._my_channel_id()
-        if owner_channel_id != authenticated_channel_id:
-            raise PermissionError(
-                "rights_basis='owned' requires the video to belong to the "
-                "authenticated YouTube channel."
-            )
-        return {
-            "verified": True,
-            "verification": "authenticated_channel_ownership",
-        }
-
-    if status.get("privacyStatus") != "public":
-        raise PermissionError(
-            "Third-party analysis imports must be public. "
-            "Use rights_basis='owned' for your own non-public videos."
-        )
-
-    if rights_basis == "creative_commons":
-        if status.get("license") != "creativeCommon":
-            raise PermissionError(
-                "rights_basis='creative_commons' requires YouTube API status.license "
-                "to be 'creativeCommon'."
-            )
-        return {
-            "verified": True,
-            "verification": "youtube_api_creative_commons_license",
-        }
-
-    if rights_basis == "explicit_permission":
-        note = (permission_note or "").strip()
-        if len(note) < 8:
-            raise ValueError(
-                "permission_note is required for rights_basis='explicit_permission'. "
-                "Briefly state the permission or authorization you have."
-            )
-        return {
-            "verified": False,
-            "verification": "user_attested_explicit_permission",
-            "permission_note": note[:500],
-        }
-
-    raise ValueError(f"Unsupported rights_basis: {rights_basis!r}")
-
-
-def _import_video_for_analysis_impl_v13(
+def _download_public_video_impl_v12(
     video_id_or_url: str,
-    rights_basis: AnalysisRightsBasis,
-    max_height: int = 1080,
-    max_duration_seconds: int = 7200,
-    permission_note: str | None = None,
+    max_height: int = 720,
+    max_duration_seconds: int = 1800,
 ) -> dict:
     video_id = _base._extract_youtube_video_id(video_id_or_url)
     max_height = max(144, min(int(max_height), 2160))
@@ -572,70 +498,50 @@ def _import_video_for_analysis_impl_v13(
     ).execute()
     items = response.get("items", [])
     if not items:
-        raise RuntimeError(
-            f"Video not found or not accessible through the YouTube API: {video_id}"
-        )
+        raise RuntimeError(f"Video not found: {video_id}")
 
     video = items[0]
     snippet = video.get("snippet", {})
     status = video.get("status", {})
     content = video.get("contentDetails", {})
 
-    rights = _verify_analysis_rights(video, rights_basis, permission_note)
-
+    if status.get("privacyStatus") != "public":
+        raise PermissionError("video_download_public_video only accepts public videos.")
     if snippet.get("liveBroadcastContent") != "none" or video.get("liveStreamingDetails"):
-        raise PermissionError(
-            "Live or scheduled YouTube videos are not accepted by this analysis import tool."
-        )
+        raise PermissionError("Live or scheduled YouTube videos are not accepted by this analysis downloader.")
 
     duration = _base._iso8601_duration_seconds(content.get("duration"))
     if duration is not None and duration > max_duration_seconds:
         raise ValueError(
-            f"Video duration is {duration}s, above "
-            f"max_duration_seconds={max_duration_seconds}."
+            f"Video duration is {duration}s, above max_duration_seconds={max_duration_seconds}."
         )
 
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     embeddable = bool(status.get("embeddable"))
     made_for_kids = bool(status.get("madeForKids"))
 
-    # Fresh account cookies + the configured proxy are now verified to resolve
-    # normal YouTube formats. Try that authorized path first, then public fallbacks.
-    attempts: list[tuple[str, bool, str | None, bool, bool]] = [
-        ("authenticated_default", True, None, False, False),
-    ]
-
+    attempts: list[tuple[str, bool, bool]] = []
     if embeddable:
-        attempts.append(
-            ("public_web_embedded", False, "web_embedded", False, False)
-        )
-    attempts.append(("public_tv", False, "tv", False, False))
-
+        attempts.append(("web_embedded", False, False))
+    attempts.append(("tv", False, False))
     if not made_for_kids:
-        attempts.append(("public_android_vr", False, "android_vr", False, False))
-
+        attempts.append(("android_vr", False, False))
     if embeddable:
-        attempts.append(
-            ("public_web_embedded_skip", False, "web_embedded", True, True)
-        )
-    attempts.append(("public_tv_skip", False, "tv", True, True))
+        attempts.append(("web_embedded", True, True))
+    attempts.append(("tv", True, True))
 
-    failures: list[dict[str, Any]] = []
-
-    for profile, use_cookies, player_client, skip_webpage, impersonate in attempts:
-        base = _base.MEDIA_DIR / f"ytanalysis_{video_id}_{uuid.uuid4().hex}"
+    failures: list[dict[str, str | bool]] = []
+    for player_client, skip_webpage, impersonate in attempts:
+        base = _base.MEDIA_DIR / f"ytpub_{video_id}_{uuid.uuid4().hex}"
         outtmpl = str(base) + ".%(ext)s"
-
         try:
-            options = _analysis_youtube_ydl_options(
+            options = _public_youtube_ydl_options(
                 outtmpl,
                 max_height,
-                use_cookies=use_cookies,
-                player_client=player_client,
+                player_client,
                 skip_webpage=skip_webpage,
                 impersonate=impersonate,
             )
-
             with _base.yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(watch_url, download=True)
 
@@ -646,113 +552,62 @@ def _import_video_for_analysis_impl_v13(
                 and not path.name.endswith((".part", ".ytdl", ".temp"))
             ]
             candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-
             if not candidates:
-                raise RuntimeError(
-                    "yt-dlp completed but produced no final media file."
-                )
+                raise RuntimeError("yt-dlp completed but produced no final media file.")
 
             path = candidates[0]
             published = _base._publish_media(path)
-            published.update(
-                {
-                    "video_id": video_id,
-                    "title": snippet.get("title"),
-                    "channel_id": snippet.get("channelId"),
-                    "channel_title": snippet.get("channelTitle"),
-                    "source_watch_url": watch_url,
-                    "source_license": status.get("license"),
-                    "duration_seconds": info.get("duration") or duration,
-                    "extractor": info.get("extractor_key") or info.get("extractor"),
-                    "max_height": max_height,
-                    "import_profile": profile,
-                    "cookies_used": use_cookies,
-                    "purpose": "temporary_ai_video_research_and_analysis",
-                    "rights_basis": rights_basis,
-                    "rights_verification": rights,
-                    "temporary": True,
-                    "redistribution_allowed": False,
-                    "analysis_only": True,
-                    "recommended_next_tools": [
-                        "video_probe",
-                        "video_extract_frames",
-                        "video_extract_audio",
-                        "video_detect_scenes",
-                        "video_editing_metrics",
-                    ],
-                }
-            )
+            published.update({
+                "video_id": video_id,
+                "title": snippet.get("title"),
+                "source_watch_url": watch_url,
+                "duration_seconds": info.get("duration") or duration,
+                "extractor": info.get("extractor_key") or info.get("extractor"),
+                "max_height": max_height,
+                "download_profile": player_client,
+                "cookies_used": False,
+                "public_analysis_download": True,
+            })
             return published
-
         except Exception as exc:
-            failures.append(
-                {
-                    "profile": profile,
-                    "cookies_used": use_cookies,
-                    "player_client": player_client,
-                    "skip_webpage": skip_webpage,
-                    "impersonate": impersonate,
-                    "error": _base._redact_proxy_secrets(str(exc))[-1200:],
-                }
-            )
-            _clean_analysis_attempt_files(base)
+            failures.append({
+                "player_client": player_client,
+                "skip_webpage": skip_webpage,
+                "impersonate": impersonate,
+                "error": _base._redact_proxy_secrets(str(exc))[-1200:],
+            })
+            _clean_public_attempt_files(base)
 
     short_failures = " | ".join(
-        f"{item['profile']}: {item['error']}" for item in failures
+        f"{item['player_client']}"
+        f"{'/skip' if item['skip_webpage'] else ''}: {item['error']}"
+        for item in failures
     )
     raise RuntimeError(
-        "Could not import this authorized YouTube video for temporary analysis. "
-        + short_failures
+        "Could not download this unrestricted public YouTube video after the no-cookie "
+        "public-client fallback ladder. " + short_failures
     )
 
 
-# server_base already registers video_download_public_video. Remove that generic
-# public downloader from MCP8 and replace it with an explicitly authorization-aware
-# analysis-import tool. All unrelated MCP tools remain unchanged.
+# server_base already registered the v10 public downloader. Replace only that tool,
+# keeping the exact same public MCP name and arguments.
 try:
     mcp.remove_tool("video_download_public_video")
 except Exception as exc:
-    raise RuntimeError(
-        "Could not remove inherited video_download_public_video tool."
-    ) from exc
+    raise RuntimeError("Could not replace inherited video_download_public_video tool.") from exc
 
 
-@mcp.tool(
-    name="youtube_import_video_for_analysis",
-    description=(
-        "Temporarily import a full YouTube video for high-detail AI research and "
-        "media analysis. Use only when the user owns the video, the video is "
-        "Creative Commons licensed, or the user has explicit permission to analyze "
-        "it. The imported media is intended for dense frame sampling, advanced "
-        "audio analysis, scene detection, editing-pattern research, and dataset "
-        "creation. It is not intended for redistribution, reposting, publishing, "
-        "copyright infringement, or permanent archival. The returned media is "
-        "temporary and should be cleaned up after analysis."
-    ),
-)
-def youtube_import_video_for_analysis(
+@mcp.tool(name="video_download_public_video")
+def video_download_public_video(
     video_id_or_url: str,
-    rights_basis: AnalysisRightsBasis,
-    max_height: int = 1080,
-    max_duration_seconds: int = 7200,
-    permission_note: str | None = None,
+    max_height: int = 720,
+    max_duration_seconds: int = 1800,
 ) -> dict:
-    """Import authorized YouTube media temporarily for dense AI analysis.
-
-    rights_basis:
-      - owned: verified against the authenticated YouTube channel.
-      - creative_commons: verified from YouTube API license metadata.
-      - explicit_permission: requires a short permission_note supplied by the user.
-
-    The returned media_id is meant to be passed to the existing video analysis
-    tools. This tool does not grant redistribution or publishing rights.
-    """
-    return _import_video_for_analysis_impl_v13(
-        video_id_or_url=video_id_or_url,
-        rights_basis=rights_basis,
+    """Download an unrestricted public YouTube video for permitted analysis."""
+    return _download_public_video_impl_v12(
+        video_id_or_url,
         max_height=max_height,
         max_duration_seconds=max_duration_seconds,
-        permission_note=permission_note,
     )
 
 
@@ -763,7 +618,7 @@ def research_tooling_status() -> dict:
         "server_build": SERVER_BUILD,
         "tools": [
             "youtube_build_research_set",
-            "youtube_import_video_for_analysis",
+            "video_download_public_video",
             "video_extract_frames",
             "video_extract_audio",
             "video_detect_scenes",
@@ -771,20 +626,9 @@ def research_tooling_status() -> dict:
             "dataset_export_jsonl",
         ],
         "dataset_strategy": (
-            "Search -> normalized candidate ranking -> authorization-aware full-video "
-            "temporary import -> dense visual/audio inspection -> scene/edit metrics -> "
-            "JSONL export."
+            "Search -> normalized candidate ranking -> public-video import -> "
+            "dense visual/audio inspection -> scene/edit metrics -> JSONL export."
         ),
-        "analysis_import": {
-            "tool": "youtube_import_video_for_analysis",
-            "rights_bases": [
-                "owned",
-                "creative_commons",
-                "explicit_permission",
-            ],
-            "purpose": "temporary_ai_video_research_and_analysis",
-            "redistribution_allowed": False,
-        },
     }
 
 
@@ -792,9 +636,6 @@ if __name__ == "__main__":
     import uvicorn
 
     if not _base.MCP_API_TOKEN:
-        print(
-            "WARNING: MCP_API_TOKEN is not set. "
-            "The MCP endpoint is running without authentication."
-        )
+        print("WARNING: MCP_API_TOKEN is not set. The MCP endpoint is running without authentication.")
     port = int(_base.os.environ.get("PORT", "10000"))
     uvicorn.run(create_app(), host="0.0.0.0", port=port)
