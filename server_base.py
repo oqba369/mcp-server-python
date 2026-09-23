@@ -51,7 +51,6 @@ class ChatGPTFileRef(BaseModel):
     file_size_bytes: int | None = None
 
 
-MCP_API_TOKEN = os.environ.get('MCP_API_TOKEN')
 RENDER_EXTERNAL_HOSTNAME = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
 YOUTUBE_CLIENT_ID = os.environ.get('YOUTUBE_CLIENT_ID')
 YOUTUBE_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
@@ -1541,7 +1540,6 @@ def debug_config_status() -> dict:
     """Sanitized configuration report. Never returns secrets."""
     return {
         'server_build': SERVER_BUILD,
-        'mcp_api_token_configured': bool(MCP_API_TOKEN),
         'youtube_client_id_configured': bool(YOUTUBE_CLIENT_ID),
         'youtube_client_secret_configured': bool(YOUTUBE_CLIENT_SECRET),
         'youtube_redirect_uri_configured': bool(YOUTUBE_REDIRECT_URI),
@@ -2203,31 +2201,10 @@ async def media_download_route(request: Request) -> Response:
         return JSONResponse({'error': 'Media file not found.'}, status_code=404)
     return FileResponse(str(path), filename=path.name, headers={'Cache-Control': 'private, max-age=300'})
 
-class BearerAuthMiddleware:
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-    async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        public_prefixes = ('/health', '/oauth/start', '/oauth/callback', '/media/')
-        if scope['type'] != 'http' or any(scope['path'].startswith(p) for p in public_prefixes):
-            await self.app(scope, receive, send)
-            return
-        headers = dict(scope.get('headers', []))
-        auth = headers.get(b'authorization', b'').decode()
-        if MCP_API_TOKEN and hmac.compare_digest(auth, f'Bearer {MCP_API_TOKEN}'):
-            await self.app(scope, receive, send)
-            return
-        response = JSONResponse({'jsonrpc': '2.0', 'error': {'code': -32001, 'message': 'Unauthorized'}, 'id': None}, status_code=401)
-        await response(scope, receive, send)
-
 def create_app():
-    app = mcp.streamable_http_app()
-    if MCP_API_TOKEN:
-        app.add_middleware(BearerAuthMiddleware)
-    return app
+    return mcp.streamable_http_app()
 
 if __name__ == '__main__':
     import uvicorn
-    if not MCP_API_TOKEN:
-        print('WARNING: MCP_API_TOKEN is not set. The MCP endpoint is running without authentication.')
     port = int(os.environ.get('PORT', '10000'))
     uvicorn.run(create_app(), host='0.0.0.0', port=port)
