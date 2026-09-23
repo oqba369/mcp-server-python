@@ -1438,10 +1438,5 @@ def research_tooling_status() -> dict:
 if __name__ == "__main__":
     import uvicorn
 
-    if not _base.MCP_API_TOKEN:
-        print(
-            "WARNING: MCP_API_TOKEN is not set. "
-            "The MCP endpoint is running without authentication."
-        )
     port = int(_base.os.environ.get("PORT", "10000"))
     uvicorn.run(create_app(), host="0.0.0.0", port=port)
