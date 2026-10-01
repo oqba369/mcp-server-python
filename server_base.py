@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, quote, urlsplit, urljoin
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, AnyHttpUrl
 
 import httpx
 import imageio_ffmpeg
@@ -27,6 +27,10 @@ import yt_dlp
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+
+from multiuser_oauth import MultiUserYouTubeOAuthProvider
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, RedirectResponse, HTMLResponse, FileResponse
@@ -52,9 +56,21 @@ class ChatGPTFileRef(BaseModel):
 
 
 RENDER_EXTERNAL_HOSTNAME = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
-YOUTUBE_CLIENT_ID = os.environ.get('YOUTUBE_CLIENT_ID')
-YOUTUBE_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
-YOUTUBE_REDIRECT_URI = os.environ.get('YOUTUBE_REDIRECT_URI')
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID') or os.environ.get('YOUTUBE_CLIENT_ID')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET') or os.environ.get('YOUTUBE_CLIENT_SECRET')
+GOOGLE_REDIRECT_URI = os.environ.get('GOOGLE_REDIRECT_URI') or os.environ.get('YOUTUBE_REDIRECT_URI')
+DATABASE_URL = os.environ.get('DATABASE_URL')
+MCP_TOKEN_ENCRYPTION_KEY = os.environ.get('MCP_TOKEN_ENCRYPTION_KEY')
+MCP_PUBLIC_BASE_URL = (
+    os.environ.get('MCP_PUBLIC_BASE_URL')
+    or (f"https://{RENDER_EXTERNAL_HOSTNAME}" if RENDER_EXTERNAL_HOSTNAME else 'http://127.0.0.1:8000')
+).rstrip('/')
+MCP_RESOURCE_URL = f"{MCP_PUBLIC_BASE_URL}/mcp"
+
+# Backward-compatible aliases for the existing YouTube helper code.
+YOUTUBE_CLIENT_ID = GOOGLE_CLIENT_ID
+YOUTUBE_CLIENT_SECRET = GOOGLE_CLIENT_SECRET
+YOUTUBE_REDIRECT_URI = GOOGLE_REDIRECT_URI
 YOUTUBE_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
 # YouTube cookies:
@@ -101,10 +117,51 @@ DENO_DIR = Path(os.environ.get('DENO_DIR', '/tmp/youtube_mcp_bin'))
 DENO_EXE = DENO_DIR / 'deno'
 DENO_DOWNLOAD_TIMEOUT = int(os.environ.get('DENO_DOWNLOAD_TIMEOUT', '180'))
 
+MULTIUSER_OAUTH_ENABLED = bool(
+    DATABASE_URL
+    and GOOGLE_CLIENT_ID
+    and GOOGLE_CLIENT_SECRET
+    and GOOGLE_REDIRECT_URI
+    and MCP_PUBLIC_BASE_URL
+)
+
+OAUTH_PROVIDER = (
+    MultiUserYouTubeOAuthProvider(
+        database_url=DATABASE_URL,
+        google_client_id=GOOGLE_CLIENT_ID,
+        google_redirect_uri=GOOGLE_REDIRECT_URI,
+        google_scopes=YOUTUBE_SCOPES,
+        issuer_url=MCP_PUBLIC_BASE_URL,
+        resource_url=MCP_RESOURCE_URL,
+        encryption_secret=MCP_TOKEN_ENCRYPTION_KEY,
+    )
+    if MULTIUSER_OAUTH_ENABLED
+    else None
+)
+
+MCP_AUTH_SETTINGS = (
+    AuthSettings(
+        issuer_url=AnyHttpUrl(MCP_PUBLIC_BASE_URL),
+        resource_server_url=AnyHttpUrl(MCP_RESOURCE_URL),
+        required_scopes=['youtube'],
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=['youtube'],
+            default_scopes=['youtube'],
+        ),
+        revocation_options=RevocationOptions(enabled=True),
+        validate_token_resource=True,
+    )
+    if MULTIUSER_OAUTH_ENABLED
+    else None
+)
+
 mcp = FastMCP(
     'youtube-mcp',
     stateless_http=True,
     json_response=True,
+    auth_server_provider=OAUTH_PROVIDER,
+    auth=MCP_AUTH_SETTINGS,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=bool(RENDER_EXTERNAL_HOSTNAME),
         allowed_hosts=[RENDER_EXTERNAL_HOSTNAME] if RENDER_EXTERNAL_HOSTNAME else [],
@@ -125,10 +182,27 @@ def _oauth_flow(state: str | None = None) -> Flow:
     flow.redirect_uri = YOUTUBE_REDIRECT_URI
     return flow
 
+def _authenticated_subject() -> str:
+    token = get_access_token()
+    if not token or not token.subject:
+        raise RuntimeError('This YouTube tool requires an authenticated MCP user.')
+    return token.subject
+
 def _youtube_credentials() -> Credentials:
-    if not YOUTUBE_REFRESH_TOKEN:
-        raise RuntimeError('YouTube is not authorized yet. Open /oauth/start and authorize.')
-    credentials = Credentials(token=None, refresh_token=YOUTUBE_REFRESH_TOKEN, token_uri='https://oauth2.googleapis.com/token', client_id=YOUTUBE_CLIENT_ID, client_secret=YOUTUBE_CLIENT_SECRET, scopes=YOUTUBE_SCOPES)
+    if OAUTH_PROVIDER is not None:
+        refresh_token = OAUTH_PROVIDER.get_google_refresh_token(_authenticated_subject())
+    else:
+        refresh_token = YOUTUBE_REFRESH_TOKEN
+    if not refresh_token:
+        raise RuntimeError('YouTube is not authorized for this user.')
+    credentials = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri='https://oauth2.googleapis.com/token',
+        client_id=YOUTUBE_CLIENT_ID,
+        client_secret=YOUTUBE_CLIENT_SECRET,
+        scopes=YOUTUBE_SCOPES,
+    )
     credentials.refresh(GoogleAuthRequest())
     return credentials
 
@@ -1031,7 +1105,21 @@ def hello(name: str) -> str:
 
 @mcp.tool()
 def youtube_auth_status() -> dict:
-    return {'client_configured': bool(YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REDIRECT_URI), 'authorized': bool(YOUTUBE_REFRESH_TOKEN), 'scopes': YOUTUBE_SCOPES}
+    if OAUTH_PROVIDER is not None:
+        status = OAUTH_PROVIDER.get_connection_status(_authenticated_subject())
+        return {
+            'mode': 'multi_user_oauth',
+            'client_configured': True,
+            'authorized': bool(status.get('connected')),
+            'connection': status,
+            'scopes': YOUTUBE_SCOPES,
+        }
+    return {
+        'mode': 'legacy_single_user',
+        'client_configured': bool(YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REDIRECT_URI),
+        'authorized': bool(YOUTUBE_REFRESH_TOKEN),
+        'scopes': YOUTUBE_SCOPES,
+    }
 
 @mcp.tool()
 def youtube_my_channel() -> dict:
@@ -1544,6 +1632,10 @@ def debug_config_status() -> dict:
         'youtube_client_secret_configured': bool(YOUTUBE_CLIENT_SECRET),
         'youtube_redirect_uri_configured': bool(YOUTUBE_REDIRECT_URI),
         'youtube_refresh_token_configured': bool(YOUTUBE_REFRESH_TOKEN),
+        'multiuser_oauth_enabled': MULTIUSER_OAUTH_ENABLED,
+        'database_configured': bool(DATABASE_URL),
+        'token_encryption_key_configured': bool(MCP_TOKEN_ENCRYPTION_KEY),
+        'mcp_resource_url': MCP_RESOURCE_URL,
         'youtube_cookies': _cookie_status_public(),
         'youtube_proxy': _proxy_public_config(),
         'media_dir': str(MEDIA_DIR),
@@ -2150,43 +2242,98 @@ def media_cleanup(confirm: bool = False) -> dict:
 
 @mcp.custom_route('/health', methods=['GET'])
 async def health(request: Request) -> Response:
-    return JSONResponse({'status': 'ok', 'service': 'youtube-mcp', 'server_build': SERVER_BUILD, 'server_sha256': _server_file_fingerprint().get('sha256'), 'youtube_client_configured': bool(YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REDIRECT_URI), 'youtube_authorized': bool(YOUTUBE_REFRESH_TOKEN), 'ffmpeg': FFMPEG_EXE, 'deno_on_path': shutil.which('deno'), 'deno_cached': str(DENO_EXE) if DENO_EXE.exists() else None, 'youtube_proxy_configured': bool(_youtube_proxy_url()), 'youtube_proxy_public': _proxy_public_config(), 'youtube_cookies': _cookie_status_public()})
+    return JSONResponse({
+        'status': 'ok',
+        'service': 'youtube-mcp',
+        'server_build': SERVER_BUILD,
+        'server_sha256': _server_file_fingerprint().get('sha256'),
+        'youtube_client_configured': bool(YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REDIRECT_URI),
+        'oauth_mode': 'multi_user' if MULTIUSER_OAUTH_ENABLED else 'legacy_single_user',
+        'database_configured': bool(DATABASE_URL),
+        'token_encryption_key_configured': bool(MCP_TOKEN_ENCRYPTION_KEY),
+        'mcp_resource_url': MCP_RESOURCE_URL,
+        'ffmpeg': FFMPEG_EXE,
+        'deno_on_path': shutil.which('deno'),
+        'deno_cached': str(DENO_EXE) if DENO_EXE.exists() else None,
+        'youtube_proxy_configured': bool(_youtube_proxy_url()),
+        'youtube_proxy_public': _proxy_public_config(),
+        'youtube_cookies': _cookie_status_public(),
+    })
 
 @mcp.custom_route('/oauth/start', methods=['GET'])
 async def oauth_start(request: Request) -> Response:
-    try:
-        flow = _oauth_flow()
-    except Exception as exc:
-        return JSONResponse({'error': str(exc)}, status_code=500)
-    authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true', prompt='consent')
-    response = RedirectResponse(authorization_url, status_code=302)
-    response.set_cookie('youtube_oauth_state', state, max_age=600, httponly=True, secure=True, samesite='lax')
-    return response
+    return HTMLResponse(
+        '<h2>YouTube MCP</h2><p>Connect this server from an MCP client. '
+        'The client will start OAuth automatically, then Google will ask you to choose '
+        'your YouTube account and approve permissions.</p>',
+        headers={'Cache-Control': 'no-store'},
+    )
 
-@mcp.custom_route('/oauth/callback', methods=['GET'])
-async def oauth_callback(request: Request) -> Response:
+@mcp.custom_route('/oauth/google/callback', methods=['GET'])
+async def oauth_google_callback(request: Request) -> Response:
+    if OAUTH_PROVIDER is None:
+        return HTMLResponse('<h2>Multi-user OAuth is not configured.</h2>', status_code=503)
+
     oauth_error = request.query_params.get('error')
     if oauth_error:
-        return HTMLResponse('<h2>Authorization failed</h2>' f'<p>{html.escape(oauth_error)}</p>', status_code=400)
+        return HTMLResponse(
+            '<h2>YouTube authorization failed.</h2>'
+            f'<p>{html.escape(oauth_error)}</p>',
+            status_code=400,
+            headers={'Cache-Control': 'no-store'},
+        )
+
     state = request.query_params.get('state')
-    expected_state = request.cookies.get('youtube_oauth_state')
-    if not state or not expected_state or not hmac.compare_digest(state, expected_state):
-        return HTMLResponse("<h2>Invalid OAuth state.</h2><p>Start again from <a href='/oauth/start'>/oauth/start</a>.</p>", status_code=400)
     code = request.query_params.get('code')
-    if not code:
-        return HTMLResponse('<h2>Missing authorization code.</h2>', status_code=400)
+    if not state or not code:
+        return HTMLResponse(
+            '<h2>Missing OAuth state or authorization code.</h2>',
+            status_code=400,
+            headers={'Cache-Control': 'no-store'},
+        )
+
     try:
         flow = _oauth_flow(state=state)
         flow.fetch_token(code=code)
-        refresh_token = flow.credentials.refresh_token
+        google_credentials = flow.credentials
+        refresh_token = google_credentials.refresh_token
+        if not refresh_token:
+            raise RuntimeError('Google did not return an offline refresh token.')
+
+        youtube = build(
+            'youtube',
+            'v3',
+            credentials=google_credentials,
+            cache_discovery=False,
+        )
+        result = youtube.channels().list(part='id,snippet', mine=True).execute()
+        items = result.get('items', [])
+        if not items:
+            raise RuntimeError('No YouTube channel was found for the selected Google account.')
+
+        channel = items[0]
+        channel_id = channel['id']
+        channel_title = channel.get('snippet', {}).get('title')
+        subject = f'youtube:{channel_id}'
+        granted_scopes = list(google_credentials.scopes or YOUTUBE_SCOPES)
+
+        client_redirect = OAUTH_PROVIDER.complete_google_authorization(
+            state=state,
+            subject=subject,
+            channel_id=channel_id,
+            channel_title=channel_title,
+            google_refresh_token=refresh_token,
+            granted_scopes=granted_scopes,
+        )
     except Exception as exc:
-        return HTMLResponse('<h2>Token exchange failed.</h2>' f'<pre>{html.escape(str(exc))}</pre>', status_code=500)
-    if not refresh_token:
-        return HTMLResponse("<h2>No refresh token returned.</h2><p>Start again from <a href='/oauth/start'>/oauth/start</a>.</p>", status_code=500)
-    response = HTMLResponse("<h2>YouTube authorization succeeded ✅</h2><p>Save this value directly in Render as <b>YOUTUBE_REFRESH_TOKEN</b>.</p><textarea style='width:95%;height:140px;font-family:monospace;'>" + html.escape(refresh_token) + "</textarea><p><b>Keep this token secret. Do not paste it into chat or GitHub.</b></p><p>After saving it in Render, redeploy the service.</p>")
-    response.delete_cookie('youtube_oauth_state')
-    response.headers['Cache-Control'] = 'no-store'
-    return response
+        return HTMLResponse(
+            '<h2>YouTube authorization could not be completed.</h2>'
+            f'<pre>{html.escape(str(exc))}</pre>',
+            status_code=500,
+            headers={'Cache-Control': 'no-store'},
+        )
+
+    return RedirectResponse(client_redirect, status_code=302, headers={'Cache-Control': 'no-store'})
 
 @mcp.custom_route('/media/{token}/{filename}', methods=['GET'])
 async def media_download_route(request: Request) -> Response:
