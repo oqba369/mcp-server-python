@@ -1,4 +1,4 @@
-mcp>=1.27,<2
+mcp>=1.30,<2
 uvicorn
 starlette
 httpx
@@ -7,3 +7,6 @@ google-auth-oauthlib
 google-auth-httplib2
 imageio-ffmpeg
 yt-dlp[default,curl-cffi]
+
+psycopg[binary]
+cryptography
